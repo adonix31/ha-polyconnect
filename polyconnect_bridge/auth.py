@@ -13,6 +13,7 @@ Public API (parity with v1 CaptureManager):
   - mgr.refresh()                    -> force a fresh login (new addition)
 """
 from __future__ import annotations
+from versioning import get_app_version
 
 import base64
 import datetime as dt
@@ -211,7 +212,7 @@ def _login_remote(email: str, password: str, terminal_id: str, terminal_key: str
         "e": email.strip().lower(),
         "h": pwd_hash,
         "tid": terminal_id,
-        "av": "9.0",
+        "av": get_app_version(),
         "pn": "com.polytropic.pool",
     }
     envelope = _make_terminal_signed({"args": args}, terminal_id, terminal_key)
