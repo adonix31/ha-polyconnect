@@ -37,6 +37,7 @@ log = logging.getLogger("polyconnect.auth")
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("POLYCONNECT_DATA_DIR", "/data"))
 TERMINAL_FILE = DATA_DIR / "terminal.json"   # { terminal_id, terminal_transaction_key } — long-lived
+APP_VERSION_FILE = DATA_DIR / "app_version.json"  # Persistent minimum compatible app version
 SESSION_FILE = DATA_DIR / "session.json"     # { token, url, issued_at } — short-lived
 IDS_FILE = DATA_DIR / "ids.json"             # { installation_id, heat_pump_id } — discovered/configured
 LEGACY_TOKEN_FILE = DATA_DIR / "token.txt"   # v1 leftover; migrated on first run
@@ -203,7 +204,7 @@ def _register_terminal_remote() -> tuple[str, str]:
     return payload["ti"], payload["ttk"]
 
 
-def _login_remote(email: str, password: str, terminal_id: str, terminal_key: str) -> tuple[str, str]:
+def _login_remote(email: str, password: str, terminal_id: str, terminal_key: str, app_version: str = "9.0") -> tuple[str, str]:
     """POST /Irc/Application/Login. Returns (token, url) on success."""
     pwd_hash = _sha256_hex(PRE_SALT + password + POST_SALT)
     args = {
@@ -211,7 +212,7 @@ def _login_remote(email: str, password: str, terminal_id: str, terminal_key: str
         "e": email.strip().lower(),
         "h": pwd_hash,
         "tid": terminal_id,
-        "av": "9.0",
+        "av": app_version,
         "pn": "com.polytropic.pool",
     }
     envelope = _make_terminal_signed({"args": args}, terminal_id, terminal_key)
@@ -298,6 +299,7 @@ class AuthManager:
         self._session_issued_at: float = 0.0
         self.credentials = Credentials()
         self._last_error: str | None = None
+        self.app_version = "9.0"
         self._load_state()
         # Best-effort initial login if credentials are configured but no session yet.
         if self._email and self._password and not self.credentials.token:
@@ -309,6 +311,15 @@ class AuthManager:
     # ── persistence ───────────────────────────────────────────────────────────
     def _load_state(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if APP_VERSION_FILE.exists():
+            try:
+                candidate = json.loads(APP_VERSION_FILE.read_text()).get("app_version")
+                if isinstance(candidate, str) and re.fullmatch(r"\d+(?:\.\d+){1,3}", candidate):
+                    self.app_version = max(
+                        (self.app_version, candidate),
+                        key=lambda v: tuple(int(p) for p in v.split(".")))
+            except (OSError, ValueError, TypeError):
+                log.warning("Ignoring invalid persisted application version")
 
         if TERMINAL_FILE.exists():
             try:
@@ -410,7 +421,8 @@ class AuthManager:
         self._ensure_terminal()
         log.info("Logging in as %s …", self._email)
         token, url = _login_remote(self._email, self._password,
-                                   self._terminal_id, self._terminal_key)  # type: ignore[arg-type]
+                                   self._terminal_id, self._terminal_key,
+                                   self.app_version)  # type: ignore[arg-type]
         self.credentials.token = token
         self._session_url = url
         self._session_issued_at = time.time()
@@ -425,6 +437,26 @@ class AuthManager:
             if not self.credentials.token or not self._session_url:
                 return None
             return f"{self._session_url.rstrip('/')}/{self.credentials.token}"
+
+    def upgrade_app_version(self, required: str) -> bool:
+        """Persist a newer app version and renew login once; never downgrade."""
+        if not isinstance(required, str) or not re.fullmatch(r"\d+(?:\.\d+){1,3}", required):
+            raise AuthError("Invalid minimum application version")
+        with self._lock:
+            def parts(value):
+                return tuple(int(part) for part in value.split("."))
+            if parts(required) <= parts(self.app_version):
+                return False
+            prior = self.app_version
+            self.app_version = required
+            try:
+                self._ensure_session()
+                APP_VERSION_FILE.write_text(json.dumps({"app_version": required}) + "\n")
+            except Exception:
+                self.app_version = prior
+                raise
+            log.info("Upgraded declared Polyconnect app version to %s", required)
+            return True
 
     def refresh(self) -> dict:
         """Force a new login (keeps the same terminal). Idempotent under lock."""
