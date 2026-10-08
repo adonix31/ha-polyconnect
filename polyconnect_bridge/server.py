@@ -457,6 +457,63 @@ class PolyconnectController:
         page = self._page
         log.info("Loading Polyconnect application from %s", BASE)
         page.goto(app_url, wait_until="domcontentloaded", timeout=30_000)
+
+        # Polyconnect may serve a standalone minimum-version page instead of
+        # starting Blazor. Upgrade exactly once, then use the new session URL.
+        try:
+            page.wait_for_function(
+                "() => document.body && document.body.innerText.trim().length > 10",
+                timeout=8_000)
+        except Exception:
+            pass
+        if page.evaluate("""() => {
+            const title = document.title.toLowerCase();
+            return title.includes('nouvelle version') ||
+                   title.includes('new version') ||
+                   title.includes('neue version');
+        }"""):
+            import requests
+            from versioning import (
+                is_trusted_app_origin, parse_min_version,
+                is_newer, get_app_version, upgrade_app_version,
+            )
+            if not is_trusted_app_origin(BASE):
+                raise RuntimeError("Update-required page on untrusted app origin")
+            response = requests.get(BASE + "/config.js", timeout=10,
+                                    allow_redirects=False)
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Cannot read minimum app version (HTTP {response.status_code})")
+            required = parse_min_version(response.text)
+            if not required or not is_newer(required, get_app_version()):
+                raise RuntimeError("Update required but no newer valid version found")
+            if not upgrade_app_version(required):
+                raise RuntimeError("Could not persist required app version")
+            log.warning("Polyconnect requires app version %s; refreshing session", required)
+            refresh = _auth_mgr.refresh()
+            if not refresh.get("ok"):
+                raise RuntimeError("App version upgrade authentication failed")
+            app_url = _auth_mgr.get_app_url()
+            if not app_url:
+                raise RuntimeError("Updated login did not return an application URL")
+            parsed = urlsplit(app_url)
+            if parsed.scheme != "https" or not is_trusted_app_origin(
+                f"{parsed.scheme}://{parsed.netloc}"
+            ):
+                raise RuntimeError("Updated login returned an untrusted app origin")
+            BASE = f"{parsed.scheme}://{parsed.netloc}"
+            page.goto(app_url, wait_until="domcontentloaded", timeout=30_000)
+            log.info("Retried Polyconnect login on %s", BASE)
+            # Never repeat the upgrade automatically in this startup attempt.
+            try:
+                page.wait_for_function(
+                    "() => document.body && document.body.innerText.trim().length > 10",
+                    timeout=8_000)
+            except Exception:
+                pass
+            if page.evaluate("""() => /nouvelle version|new version|neue version/i.test(document.title)"""):
+                raise RuntimeError("Polyconnect still requires an app update after retry")
+
         try:
             page.wait_for_function(
                 "() => typeof Blazor !== 'undefined' && Blazor._internal",
