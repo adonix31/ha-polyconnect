@@ -46,3 +46,27 @@ def is_trusted_app_origin(origin: str) -> bool:
         and not parsed.query
         and not parsed.fragment
     )
+
+# Stored inside the add-on's persistent data mount, not the container image.
+from pathlib import Path
+
+APP_VERSION_PATH = Path("/data/app_version.json")
+DEFAULT_APP_VERSION = "9.0"
+
+
+def get_app_version() -> str:
+    try:
+        value = json.loads(APP_VERSION_PATH.read_text()).get("version")
+        if isinstance(value, str) and _VERSION.fullmatch(value):
+            return value
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return DEFAULT_APP_VERSION
+
+
+def upgrade_app_version(required: str) -> bool:
+    """Save a strictly newer version; caller must refresh auth after success."""
+    if not is_newer(required, get_app_version()):
+        return False
+    APP_VERSION_PATH.write_text(json.dumps({"version": required}) + "\n")
+    return True
