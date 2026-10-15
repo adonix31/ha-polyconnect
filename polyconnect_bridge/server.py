@@ -401,6 +401,8 @@ class PolyconnectController:
         self._page_crashed = False
         self._last_recovery_error = None
         self._last_successful_poll = None
+        self._recovery_pending = False
+        self._recovery_started_at = None
         # Which pump's /heat-pump-view/<id> the single Chromium page is currently on.
         # Smart-navigation only navigateTo's when the active pump differs.
         self._current_pump_id: str | None = None
@@ -408,6 +410,13 @@ class PolyconnectController:
         self._last_data: dict[str, dict] = {}
         self._last_change_ts: dict[str, float] = {}
         self._unchanged_count: dict[str, int] = {}
+
+    def _start_recovery(self, reason: str):
+        """Mark an unexpected browser loss; never log session credentials."""
+        if not self._recovery_pending:
+            self._recovery_pending = True
+            self._recovery_started_at = time.monotonic()
+            log.error("POLYCONNECT_RECOVERY component=browser event=lost reason=%s", reason)
 
     def _reset_browser(self):
         """Drop a crashed browser on the owning Playwright thread."""
@@ -428,6 +437,7 @@ class PolyconnectController:
 
     def _mark_page_crashed(self, _page):
         self._page_crashed = True
+        self._start_recovery("page_crashed")
         log.error("Chromium page crashed; browser will be reconstructed")
 
     def _launch(self):
@@ -450,6 +460,8 @@ class PolyconnectController:
             self._page = self._ctx.new_page()
             self._page.on("crash", self._mark_page_crashed)
             self._load_app()
+            if self._recovery_pending:
+                log.warning("POLYCONNECT_RECOVERY component=browser event=restarted auth=unchanged awaiting=status_poll")
         except Exception:
             self._reset_browser()
             raise
@@ -748,10 +760,12 @@ class PolyconnectController:
 
     def _ensure(self):
         if self._page_crashed or (self._page and self._page.is_closed()):
+            self._start_recovery("page_crashed" if self._page_crashed else "page_closed")
             self._reset_browser()
         if self._browser and self._browser.is_connected() and self._page:
             return
-        if self._pw:
+        if self._pw or self._browser:
+            self._start_recovery("browser_disconnected")
             self._reset_browser()
         log.info("(Re-)launching browser …")
         self._launch()
@@ -935,6 +949,12 @@ class PolyconnectController:
             self._last_data[pid] = data
             self._last_successful_poll = time.time()
             self._last_recovery_error = None
+            if self._recovery_pending:
+                elapsed = (time.monotonic() - self._recovery_started_at
+                           if self._recovery_started_at is not None else 0.0)
+                log.warning("POLYCONNECT_RECOVERY component=browser event=monitoring_restored elapsed_s=%.1f", elapsed)
+                self._recovery_pending = False
+                self._recovery_started_at = None
             return data
 
     # ── set_mode ──────────────────────────────────────────────────────────────
@@ -1438,6 +1458,7 @@ def _safe(fn, *a, **kw):
             "browser closed", "connection closed",
         ))
         if crashed:
+            ctrl._start_recovery("playwright_target_closed")
             log.error("Playwright failure: %s; resetting browser", e)
             try:
                 ctrl._pw_thread.call(ctrl._reset_browser)
@@ -1447,6 +1468,7 @@ def _safe(fn, *a, **kw):
                     return result, 200
             except Exception as recovery_error:
                 log.exception("Browser recovery failed")
+                log.error("POLYCONNECT_RECOVERY component=browser event=failed stage=status_retry")
                 ctrl._last_recovery_error = str(recovery_error)
                 return {"error": "Browser recovery failed", "details": str(recovery_error)}, 503
             return {"error": "Browser crashed; browser reset, retry request"}, 503
@@ -2275,7 +2297,13 @@ body {{
         </svg>
         Restart Browser
       </button>
-      <button type="button" class="btn btn-outline" id="btn-auth-renew">Renew Session</button>
+      <button type="button" class="btn btn-outline" id="btn-auth-renew">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 7v5h-5"/><path d="M4 17v-5h5"/>
+          <path d="M5.8 9a7 7 0 0 1 12-2L20 12M4 12l2.2 5a7 7 0 0 0 12-2"/>
+        </svg>
+        Renew Session
+      </button>
       <button type="button" class="btn btn-outline" id="btn-restart">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 2v6"/><path d="M18.36 5.64a9 9 0 1 1-12.73 0"/>
