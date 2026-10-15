@@ -398,6 +398,9 @@ class PolyconnectController:
         self._browser= None
         self._ctx    = None
         self._page   = None
+        self._page_crashed = False
+        self._last_recovery_error = None
+        self._last_successful_poll = None
         # Which pump's /heat-pump-view/<id> the single Chromium page is currently on.
         # Smart-navigation only navigateTo's when the active pump differs.
         self._current_pump_id: str | None = None
@@ -405,6 +408,27 @@ class PolyconnectController:
         self._last_data: dict[str, dict] = {}
         self._last_change_ts: dict[str, float] = {}
         self._unchanged_count: dict[str, int] = {}
+
+    def _reset_browser(self):
+        """Drop a crashed browser on the owning Playwright thread."""
+        browser, pw = self._browser, self._pw
+        self._page = self._ctx = self._browser = self._pw = None
+        self._current_pump_id = None
+        self._page_crashed = False
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+
+    def _mark_page_crashed(self, _page):
+        self._page_crashed = True
+        log.error("Chromium page crashed; browser will be reconstructed")
 
     def _launch(self):
         from playwright.sync_api import sync_playwright
@@ -426,6 +450,8 @@ class PolyconnectController:
             viewport={"width": 390, "height": 844}, locale="fr-FR")
         # Legacy affinity cookie is not valid for the server-provided origin.
         self._page    = self._ctx.new_page()
+        self._page_crashed = False
+        self._page.on("crash", self._mark_page_crashed)
         try:
             self._load_app()
         except Exception:
@@ -733,7 +759,9 @@ class PolyconnectController:
         return pumps
 
     def _ensure(self):
-        if self._browser and self._browser.is_connected():
+        if self._page_crashed or (self._page and self._page.is_closed()):
+            self._reset_browser()
+        if self._browser and self._browser.is_connected() and self._page:
             return
         log.info("(Re-)launching browser …")
         self._launch()
@@ -915,6 +943,8 @@ class PolyconnectController:
                 self._unchanged_count[pid] = 0
                 self._last_change_ts[pid] = time.time()
             self._last_data[pid] = data
+            self._last_successful_poll = time.time()
+            self._last_recovery_error = None
             return data
 
     # ── set_mode ──────────────────────────────────────────────────────────────
@@ -1409,12 +1439,30 @@ def _error_payload(e: Exception) -> tuple[dict, int] | None:
 def _safe(fn, *a, **kw):
     try:
         return fn(*a, **kw), 200
-    except RuntimeError as e:
-        classified = _error_payload(e)
-        if classified:
-            return classified
-        return {"error": str(e)}, 500
     except Exception as e:
+        # Only replay status reads: repeating an actuator command is unsafe.
+        message = str(e).lower()
+        crashed = any(x in message for x in (
+            "target crashed", "page crashed", "browser has been closed",
+            "target page, context or browser has been closed",
+        ))
+        if crashed:
+            log.error("Playwright failure: %s; resetting browser", e)
+            try:
+                ctrl._pw_thread.call(ctrl._reset_browser)
+                if fn == ctrl._pw_thread.call and a and getattr(a[0], "__name__", "") == "get_status":
+                    log.info("Retrying status read once after Chromium reconstruction")
+                    result = fn(*a, **kw)
+                    return result, 200
+            except Exception as recovery_error:
+                log.exception("Browser recovery failed")
+                ctrl._last_recovery_error = str(recovery_error)
+                return {"error": "Browser recovery failed", "details": str(recovery_error)}, 503
+            return {"error": "Browser crashed; browser reset, retry request"}, 503
+        if isinstance(e, RuntimeError):
+            classified = _error_payload(e)
+            if classified:
+                return classified
         log.exception("Unhandled error in %s", getattr(fn, "__name__", fn))
         return {"error": str(e)}, 500
 
@@ -1542,6 +1590,9 @@ def health():
         "terminal_registered": auth_status["terminal_registered"],
         "session_age_seconds": auth_status["session_age_seconds"],
         "last_error": auth_status["last_error"],
+        "last_successful_poll": ctrl._last_successful_poll,
+        "browser_crashed": ctrl._page_crashed,
+        "last_recovery_error": ctrl._last_recovery_error,
     })
 
 
@@ -1891,10 +1942,33 @@ def auth_status():
     return jsonify(_auth_mgr.get_status())
 
 
+@app.route("/browser/restart", methods=["POST"])
+def browser_restart():
+    """Rebuild Chromium with the saved session, without calling remote login."""
+    try:
+        def reset_and_launch():
+            ctrl._reset_browser()
+            ctrl._launch()
+        ctrl._pw_thread.call(reset_and_launch)
+        return jsonify({"ok": True, "message": "Chromium browser restarted"})
+    except Exception as exc:
+        log.exception("Manual browser restart failed")
+        return jsonify({"ok": False, "error": str(exc)}), 503
+
+
 @app.route("/auth/refresh", methods=["POST"])
 def auth_refresh():
-    """Force a new login round-trip with the currently-configured credentials."""
-    return jsonify(_auth_mgr.refresh())
+    """Renew remote authentication; activate the new session only on success."""
+    result = _auth_mgr.refresh()
+    if not result.get("ok"):
+        return jsonify(result), 503
+    try:
+        ctrl._pw_thread.call(ctrl._reset_browser)
+        ctrl._pw_thread.call(ctrl._launch)
+    except Exception as exc:
+        log.exception("New authentication succeeded but browser restart failed")
+        return jsonify({"ok": False, "error": str(exc)}), 503
+    return jsonify({"ok": True, "message": "Session renewed and browser restarted"})
 
 
 @app.route("/auth/credentials", methods=["POST"])
@@ -2208,8 +2282,9 @@ body {{
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>
         </svg>
-        Refresh Browser
+        Restart Browser
       </button>
+      <button type="button" class="btn btn-outline" id="btn-auth-renew">Renew Session</button>
       <button type="button" class="btn btn-outline" id="btn-restart">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 2v6"/><path d="M18.36 5.64a9 9 0 1 1-12.73 0"/>
@@ -2299,7 +2374,11 @@ function clearAuthUI() {{
 }}
 
 document.getElementById('btn-refresh').addEventListener('click', (e) => {{
-    post('auth/refresh', e.currentTarget, 'Refreshing…', 0);
+    post('browser/restart', e.currentTarget, 'Restarting browser…', 0);
+}});
+document.getElementById('btn-auth-renew').addEventListener('click', (e) => {{
+    if (!confirm('Renew authentication with Polyconnect server?')) return;
+    post('auth/refresh', e.currentTarget, 'Renewing session…', 0);
 }});
 document.getElementById('btn-restart').addEventListener('click', (e) => {{
     if (!confirm('Restart the bridge server?')) return;
