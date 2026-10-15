@@ -1,0 +1,30 @@
+name: Recovery branch checks
+on:
+  push:
+    branches: [feature/session-health-recovery]
+  workflow_dispatch:
+jobs:
+  syntax-and-recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile Python sources
+        run: python -m compileall -q polyconnect_bridge
+      - name: Verify recovery wiring
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          source = Path('polyconnect_bridge/server.py').read_text()
+          tree = ast.parse(source)
+          cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'PolyconnectController')
+          methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
+          assert {'_reset_browser', '_mark_page_crashed', '_launch', '_ensure', 'get_status'} <= methods
+          assert 'self._page.on("crash", self._mark_page_crashed)' in source
+          assert 'ctrl._pw_thread.call(ctrl._reset_browser)' in source
+          assert "post('browser/restart'" in source
+          print('Recovery wiring OK')
+          PY
