@@ -438,32 +438,20 @@ class PolyconnectController:
         # Heat pump ID is allowed to be missing on first boot — _load_app will
         # auto-discover it from the SPA. Same for installation_id.
 
-        if self._pw:
-            try: self._pw.stop()
-            except: pass
-        self._pw      = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
-        self._ctx     = self._browser.new_context(
-            extra_http_headers=CF, user_agent=UA,
-            viewport={"width": 390, "height": 844}, locale="fr-FR")
-        # Legacy affinity cookie is not valid for the server-provided origin.
-        self._page    = self._ctx.new_page()
-        self._page_crashed = False
-        self._page.on("crash", self._mark_page_crashed)
+        self._reset_browser()
         try:
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
+            self._ctx = self._browser.new_context(
+                extra_http_headers=CF, user_agent=UA,
+                viewport={"width": 390, "height": 844}, locale="fr-FR")
+            self._page = self._ctx.new_page()
+            self._page.on("crash", self._mark_page_crashed)
             self._load_app()
         except Exception:
-            # Clean up so _ensure() forces a fresh relaunch next call
-            try:
-                self._browser.close()
-                self._pw.stop()
-            except Exception:
-                pass
-            self._browser = None
-            self._pw      = None
-            self._page    = None
+            self._reset_browser()
             raise
 
     def _load_app(self):
@@ -763,6 +751,8 @@ class PolyconnectController:
             self._reset_browser()
         if self._browser and self._browser.is_connected() and self._page:
             return
+        if self._pw:
+            self._reset_browser()
         log.info("(Re-)launching browser …")
         self._launch()
 
@@ -1445,6 +1435,7 @@ def _safe(fn, *a, **kw):
         crashed = any(x in message for x in (
             "target crashed", "page crashed", "browser has been closed",
             "target page, context or browser has been closed",
+            "browser closed", "connection closed",
         ))
         if crashed:
             log.error("Playwright failure: %s; resetting browser", e)
